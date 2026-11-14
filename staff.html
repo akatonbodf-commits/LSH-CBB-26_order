@@ -113,6 +113,16 @@
           <div class="deposit-box">
             <label for="pos-deposit">お預かり金額（円）</label>
             <input type="number" id="pos-deposit" placeholder="例: 5000" oninput="calcChange()">
+
+            <!-- 金種クイックボタン -->
+            <div class="quick-denom-row">
+              <button type="button" class="btn-denom btn-denom-exact" onclick="setExactDeposit()">ちょうど</button>
+              <button type="button" class="btn-denom" onclick="addDepositAmount(1000)">+1,000円</button>
+              <button type="button" class="btn-denom" onclick="addDepositAmount(5000)">+5,000円</button>
+              <button type="button" class="btn-denom" onclick="addDepositAmount(10000)">+10,000円</button>
+              <button type="button" class="btn-denom btn-denom-clear" onclick="clearDepositAmount()">クリア</button>
+            </div>
+
             <div class="change-display">
               お釣り: ¥<span id="pos-change">0</span>
             </div>
@@ -142,19 +152,40 @@
             </div>
           </div>
         </div>
+
+        <!-- 直近の完了済み履歴 -->
+        <div class="card">
+          <div class="card-header-row">
+            <h3>直近の引き渡し完了履歴（最新10件）</h3>
+            <span class="hint-text" style="margin:0;">誤完了時の差し戻し確認用</span>
+          </div>
+          <div id="completed-history-list" class="history-list"></div>
+        </div>
       </section>
 
       <!-- ③ ダッシュボード画面 -->
       <section id="panel-dashboard" class="panel">
         <div class="kpi-grid">
           <div class="kpi-box">
-            <div class="kpi-label">現在の総売上（決済済み以上）</div>
+            <div class="kpi-label">現在の総売上（純売上理論値）</div>
             <div id="kpi-total-sales" class="kpi-value">¥0</div>
+          </div>
+          <div class="kpi-box kpi-box-info">
+            <div class="kpi-label">レジお預かり総額（received）</div>
+            <div id="kpi-total-received" class="kpi-value">¥0</div>
+          </div>
+          <div class="kpi-box kpi-box-warning">
+            <div class="kpi-label">お釣り払い出し総額（change）</div>
+            <div id="kpi-total-change" class="kpi-value">¥0</div>
           </div>
           <div class="kpi-box kpi-box-success">
             <div class="kpi-label">有効注文件数</div>
             <div id="kpi-order-count" class="kpi-value">0件</div>
           </div>
+        </div>
+
+        <div class="card register-summary-note">
+          <strong>レジ締め確認メモ:</strong> レジ内の現金残高から「開始時の釣銭準備金」を引いた金額が、<strong>現在の総売上（お預かり総額 − お釣り総額）</strong>と一致していれば過不足ゼロです。
         </div>
 
         <div class="card">
