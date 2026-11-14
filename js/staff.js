@@ -1,7 +1,8 @@
 /**
- * 2026 CBB イベント物販・POSレジシステム スタッフ管理画面スクリプト (js/staff.js v3.5)
- * - 全入力欄（スタッフ認証・ユーザーID検索・お預かり金額）のEnterキー送信対応
- * - レジ決済・商品引き渡しともにユーザーID単位で全注文を商品別合算
+ * 2026 CBB イベント物販・POSレジシステム スタッフ管理画面スクリプト (js/staff.js v3.6)
+ * - レジ金種クイックボタン（ちょうど / +1,000 / +5,000 / +10,000 / クリア）
+ * - 完了済み履歴の簡易確認（最新10件）＆誤完了時の差し戻し
+ * - ダッシュボードへのレジ締め集計（総売上・お預かり総額・お釣り総額）
  */
 
 // ==========================================
@@ -49,7 +50,6 @@ function bindEnterKey(elementId, callback) {
 }
 
 async function initStaffPage() {
-  // 全入力欄にEnterキー送信をバインド
   bindEnterKey("auth-gmail", submitStaffAuth);
   bindEnterKey("auth-pin", submitStaffAuth);
   bindEnterKey("manual-user-id", searchUserManual);
@@ -200,6 +200,7 @@ function updateLastSyncLabel() {
 
 function renderAllStaffViews() {
   renderHandoverList();
+  renderCompletedHistory();
   renderDashboard();
 
   if (selectedPosUserId) {
@@ -224,7 +225,7 @@ function switchTab(tabName, btn) {
 }
 
 // ==========================================
-// 2. レジ決済（POS）・軽量ライブカメラQRスキャン機能
+// 2. レジ決済（POS）・軽量ライブカメラQRスキャン＆金種ボタン機能
 // ==========================================
 async function toggleCamera() {
   if (scanning) {
@@ -478,6 +479,27 @@ function loadUserOrdersIntoPos(userId, resetDeposit = true) {
   payBtn.textContent = `現金で一括会計（${unpaidOrders.length}件・決済完了）`;
 }
 
+// 金種クイックボタン制御
+function setExactDeposit() {
+  if (currentPosUnpaidTotal <= 0) return;
+  document.getElementById("pos-deposit").value = currentPosUnpaidTotal;
+  calcChange();
+}
+
+function addDepositAmount(amount) {
+  const input = document.getElementById("pos-deposit");
+  const current = Number(input.value) || 0;
+  input.value = current + amount;
+  calcChange();
+}
+
+function clearDepositAmount() {
+  const input = document.getElementById("pos-deposit");
+  input.value = "";
+  calcChange();
+  input.focus();
+}
+
 function calcChange() {
   const depositVal = document.getElementById("pos-deposit").value;
   if (depositVal === "") {
@@ -554,7 +576,7 @@ async function cancelSingleOrderFromPos(orderId) {
 }
 
 // ==========================================
-// 3. 商品引き渡し（ピッキング）機能（ユーザー単位合算＆段階ボタン）
+// 3. 商品引き渡し（ピッキング）＆完了済み履歴確認機能
 // ==========================================
 function buildHandoverUserGroups() {
   const waitingOrders = orders.filter(o => o.status === 1 || o.status === 2);
@@ -707,14 +729,94 @@ async function updateHandoverUserStatus(userId, nextStatus) {
   }
 }
 
+/**
+ * 直近の引き渡し完了履歴（status === 3 の最新10件）を表示
+ */
+function renderCompletedHistory() {
+  const container = document.getElementById("completed-history-list");
+  if (!container) return;
+
+  const completedOrders = orders
+    .filter(o => o.status === 3)
+    .sort((a, b) => String(b.updated_at || b.created_at).localeCompare(String(a.updated_at || a.created_at)))
+    .slice(0, 10);
+
+  if (completedOrders.length === 0) {
+    container.innerHTML = `<p class="empty-placeholder" style="padding:16px 0;">まだ引き渡し完了済みの注文はありません。</p>`;
+    return;
+  }
+
+  container.innerHTML = completedOrders.map(o => {
+    const uidLabel = o.user_id ? `${o.user_id} / ` : "";
+    const itemsSummary = (o.items || [])
+      .map(i => `${i.name} × ${i.qty}点`)
+      .join("、");
+    const completedTime = o.updated_at || o.created_at;
+
+    return `
+      <div class="history-item">
+        <div>
+          <div><strong>${uidLabel}${o.id}</strong> <span style="font-size:0.8rem; color:#4a5568;">（${o.account}）</span></div>
+          <div class="history-items-summary">${itemsSummary}</div>
+          <div class="history-meta">完了時刻: ${completedTime} ／ 金額: ¥${Number(o.total_price || 0).toLocaleString()}</div>
+        </div>
+        <button type="button" class="btn-revert-outline" onclick="revertCompletedOrder('${o.id}')">
+          引き渡し前に戻す
+        </button>
+      </div>
+    `;
+  }).join("");
+}
+
+/**
+ * 誤って引き渡し完了にした注文を「決済済み（status: 1）」へ差し戻す
+ */
+async function revertCompletedOrder(orderId) {
+  if (!confirm(`注文ID「${orderId}」を引き渡し待ち（決済済み）に戻しますか？`)) {
+    return;
+  }
+
+  try {
+    await apiPost(
+      {
+        action: "updateStatus",
+        account: staffAccount,
+        pin: staffPin,
+        orderId: orderId,
+        status: 1
+      },
+      { loadingText: "引き渡し待ちへ戻しています..." }
+    );
+
+    await refreshAll({ isManual: false, silent: false, loadingText: "一覧を更新中..." });
+  } catch (err) {
+    alert("差し戻しエラー:\n" + err.message);
+  }
+}
+
 // ==========================================
-// 4. ダッシュボード機能
+// 4. ダッシュボード（売上・レジ締め集計）機能
 // ==========================================
 function renderDashboard() {
   const validPaidOrders = orders.filter(o => [1, 2, 3].includes(o.status));
   const totalSales = validPaidOrders.reduce((sum, o) => sum + Number(o.total_price || 0), 0);
 
+  // お預かり総額（received_amountが未記録の過去データがある場合はtotal_priceを補完）
+  const totalReceived = validPaidOrders.reduce((sum, o) => {
+    const rec = Number(o.received_amount);
+    if (!isNaN(rec) && rec > 0) {
+      return sum + rec;
+    }
+    return sum;
+  }, 0);
+
+  // レジ締め用: お釣り払い出し総額（お預かり総額 - 総売上、0未満にはしない）
+  const effectiveReceived = totalReceived > 0 ? totalReceived : totalSales;
+  const totalChange = Math.max(0, effectiveReceived - totalSales);
+
   document.getElementById("kpi-total-sales").textContent = `¥${totalSales.toLocaleString()}`;
+  document.getElementById("kpi-total-received").textContent = `¥${effectiveReceived.toLocaleString()}`;
+  document.getElementById("kpi-total-change").textContent = `¥${totalChange.toLocaleString()}`;
   document.getElementById("kpi-order-count").textContent = `${validPaidOrders.length}件`;
 
   const soldCountMap = {};
