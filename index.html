@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>2026 CBB - イベント物販事前注文</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <link rel="stylesheet" href="css/style.css">
+  <script src="js/config.js"></script>
+  <script src="js/app.js" defer></script>
+</head>
+<body>
+
+  <!-- スタッフ用クイックキュー（staffsシートに登録されたアカウントでのログイン時のみ表示） -->
+  <div id="staff-quick-cue" class="staff-quick-cue">
+    <div class="staff-quick-cue-inner">
+      <span>スタッフアカウント認証済み</span>
+      <a href="staff.html">スタッフ管理・レジ画面へ →</a>
+    </div>
+  </div>
+
+  <!-- ヘッダ -->
+  <header>
+    <div class="header-top">
+      <div class="header-title">2026 CBB</div>
+      <div class="header-actions">
+        <button type="button" id="btn-header-qr" class="btn-header btn-qr-header" onclick="openQrModal()">会員QRコード</button>
+        <button type="button" class="btn-header" onclick="loadPublicData(true)">↻ 在庫更新</button>
+        <button type="button" class="btn-header" onclick="openAccountModal()">アカウント切替</button>
+      </div>
+    </div>
+    <div class="account-bar">
+      <span id="display-account">未認証</span>
+      <span id="sync-status">待機中</span>
+    </div>
+  </header>
+
+  <!-- 商品一覧 -->
+  <main>
+    <div id="product-grid" class="product-grid"></div>
+  </main>
+
+  <!-- スティッキーフッターバー -->
+  <div class="sticky-footer">
+    <div class="footer-inner">
+      <button type="button" id="btn-open-cart" class="btn-open-cart" onclick="openCartModal()" disabled>
+        <span>🛒 カートを見る (<span id="footer-count">0</span>点)</span>
+        <span>合計 ¥<span id="footer-total">0</span></span>
+      </button>
+    </div>
+  </div>
+
+  <!-- アカウント入力ダイアログ -->
+  <div id="account-modal" class="modal-backdrop">
+    <div class="center-dialog">
+      <h3>Gmailアカウント認証</h3>
+      <p class="dialog-desc">
+        お客様専用のユーザーQRコードを発行するため、ご使用のGmailアドレスを入力してください。
+      </p>
+      <input type="email" id="input-gmail" placeholder="example@gmail.com" required>
+      <button type="button" id="btn-save-account" class="btn-submit-order btn-primary-bg" onclick="saveAccount()">認証して進む</button>
+    </div>
+  </div>
+
+  <!-- カートモーダル -->
+  <div id="cart-modal" class="modal-backdrop" onclick="closeCartModal(event)">
+    <div class="bottom-sheet" onclick="event.stopPropagation()">
+      <div class="sheet-header">
+        <h3>ご注文内容の確認</h3>
+        <button type="button" class="btn-close-modal" onclick="closeCartModal()">✕</button>
+      </div>
+      <div id="cart-items-container"></div>
+      <div class="modal-total-row">
+        <span>今回のお支払い合計（現地決済）</span>
+        <span>¥<span id="modal-total">0</span></span>
+      </div>
+      <p class="cancel-warning-text">
+        ※注文確定後、1時間以内にレジで決済されない場合は自動キャンセルとなります。
+      </p>
+      <button type="button" id="btn-submit-order" class="btn-submit-order" onclick="submitOrder()">注文を確定・送信</button>
+    </div>
+  </div>
+
+  <!-- ユーザー専用QRコード表示モーダル -->
+  <div id="qr-modal" class="modal-backdrop" onclick="closeQrModal(event)">
+    <div class="center-dialog" onclick="event.stopPropagation()">
+      <h3 class="qr-modal-title">お客様専用 注文QRコード</h3>
+      <p class="qr-modal-desc">
+        物販レジにてこのQRコードを提示すると、未決済のご注文をすべて一括でお会計できます。
+      </p>
+      <div class="screenshot-notice">
+        📸 このQRコードはお客様専用（固定）です。スクリーンショット保存しておくとレジでスムーズです！
+      </div>
+      <div id="qrcode-box"></div>
+      <div id="qr-user-id" class="qr-uid-label"></div>
+      <div id="qr-user-account" class="qr-acc-label"></div>
+      <div id="qr-orders-summary"></div>
+      <button type="button" class="btn-submit-order btn-primary-bg" onclick="closeQrModal()">閉じる</button>
+    </div>
+  </div>
+
+</body>
+</html>
