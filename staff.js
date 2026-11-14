@@ -1,7 +1,6 @@
 /**
- * 2026 CBB イベント物販・POSレジシステム スタッフ管理画面スクリプト (staff.js v3.3)
- * - レジ決済・商品引き渡しともにユーザーID（USR-xxxx）単位で全注文を商品別合算
- * - 引き渡しボタンはミス防止のため「ピッキング開始」->「引き渡し完了」の1段階ずつ表示
+ * 2026 CBB イベント物販・POSレジシステム スタッフ管理画面スクリプト (staff.js v3.4)
+ * - 一括決済時にお預かり金額（receivedAmount）をGASへ送信してordersシートへ記録
  */
 
 // ==========================================
@@ -480,13 +479,14 @@ async function completeBatchPayment() {
         action: "payAllByUser",
         account: staffAccount,
         pin: staffPin,
-        userId: selectedPosUserId
+        userId: selectedPosUserId,
+        receivedAmount: deposit
       },
-      { loadingText: "一括決済を確定しています..." }
+      { loadingText: "一括決済とお預かり金額を記録しています..." }
     );
 
     const change = deposit - currentPosUnpaidTotal;
-    alert(`${res.message}\nお釣り: ¥${change.toLocaleString()}`);
+    alert(`${res.message}\nお預かり: ¥${deposit.toLocaleString()} / お釣り: ¥${change.toLocaleString()}`);
     await refreshAll({ isManual: false, silent: false, loadingText: "最新状態を反映中..." });
   } catch (err) {
     alert("決済処理に失敗しました:\n" + err.message);
@@ -522,10 +522,6 @@ async function cancelSingleOrderFromPos(orderId) {
 // ==========================================
 // 3. 商品引き渡し（ピッキング）機能（ユーザー単位合算＆段階ボタン）
 // ==========================================
-
-/**
- * 引き渡し待ち注文（status: 1, 2）をユーザーID単位でグルーピング・商品別合算して返す
- */
 function buildHandoverUserGroups() {
   const waitingOrders = orders.filter(o => o.status === 1 || o.status === 2);
   const groupMap = new Map();
@@ -537,7 +533,7 @@ function buildHandoverUserGroups() {
         userId: uid,
         account: o.account || "",
         orders: [],
-        hasUnstarted: false, // status === 1 が1件でも残っていれば true
+        hasUnstarted: false,
         aggregatedItems: new Map()
       });
     }
@@ -576,7 +572,6 @@ function renderHandoverList() {
 
   listEl.innerHTML = groups.map(g => {
     const isSelected = selectedHandoverUserId === g.userId;
-    // 未着手の注文（status=1）があれば「決済済み」、すべて着手済み（status=2）なら「ピッキング中」
     const badgeColor = g.hasUnstarted ? "#38a169" : "#3182ce";
     const badgeLabel = g.hasUnstarted ? "決済済み" : "ピッキング中";
     const orderCountNote = g.orders.length > 1 ? `（注文${g.orders.length}件合算）` : "";
@@ -612,7 +607,6 @@ function selectHandoverUser(userId) {
 
   const targetOrderIds = group.orders.map(o => o.id).join(", ");
 
-  // ミス防止のため、状態に応じてどちらか1つのボタンのみを表示
   const actionButtonHtml = group.hasUnstarted
     ? `<button type="button" class="btn btn-warning" onclick="updateHandoverUserStatus('${group.userId}', 2)">
          ピッキング開始（引き渡し中へ）
