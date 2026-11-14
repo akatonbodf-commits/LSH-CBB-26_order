@@ -290,6 +290,23 @@ header {
   filter: none;
 }
 
+.btn-revert-outline {
+  background: #fff;
+  color: var(--warning);
+  border: 1px solid var(--warning);
+  padding: 5px 10px;
+  font-size: 0.78rem;
+  border-radius: 6px;
+  font-weight: bold;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn-revert-outline:hover {
+  background: #fffaf0;
+  filter: none;
+}
+
 /* レジ決済・正方形カメラプレビュー＆ブラケット枠 */
 #video-wrap {
   position: relative;
@@ -396,6 +413,7 @@ header {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 8px;
 }
 
 .sub-meta {
@@ -449,13 +467,52 @@ header {
   padding: 10px;
   border: 1px solid #cbd5e0;
   border-radius: 6px;
-  font-size: 1.1rem;
+  font-size: 1.15rem;
+  font-weight: bold;
+}
+
+/* 金種クイックボタン */
+.quick-denom-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.btn-denom {
+  flex: 1 1 auto;
+  min-width: 78px;
+  padding: 8px 10px;
+  border: 1px solid #cbd5e0;
+  border-radius: 6px;
+  background: #ffffff;
+  color: var(--primary);
+  font-size: 0.85rem;
+  font-weight: bold;
+  cursor: pointer;
+}
+
+.btn-denom:hover {
+  background: #ebf8ff;
+  border-color: var(--accent);
+  filter: none;
+}
+
+.btn-denom-exact {
+  background: #ebf8ff;
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.btn-denom-clear {
+  background: #edf2f7;
+  color: #4a5568;
 }
 
 .change-display {
   font-size: 1.25rem;
   font-weight: bold;
-  margin-top: 10px;
+  margin-top: 12px;
   color: var(--primary);
 }
 
@@ -537,6 +594,39 @@ th {
   flex: 1;
 }
 
+/* 完了済み履歴リスト */
+.history-list {
+  margin-top: 10px;
+}
+
+.history-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  margin-bottom: 8px;
+  background: #f8fafc;
+}
+
+.history-item:last-child {
+  margin-bottom: 0;
+}
+
+.history-meta {
+  font-size: 0.78rem;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.history-items-summary {
+  font-size: 0.84rem;
+  color: var(--text);
+  margin-top: 4px;
+}
+
 /* ダッシュボード KPI */
 .kpi-grid {
   display: grid;
@@ -553,19 +643,35 @@ th {
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05);
 }
 
+.kpi-box-info {
+  border-left-color: #319795;
+}
+
+.kpi-box-warning {
+  border-left-color: var(--warning);
+}
+
 .kpi-box-success {
   border-left-color: var(--success);
 }
 
 .kpi-label {
-  font-size: 0.85rem;
+  font-size: 0.82rem;
   color: #4a5568;
 }
 
 .kpi-value {
-  font-size: 1.6rem;
+  font-size: 1.55rem;
   font-weight: bold;
   margin-top: 4px;
+}
+
+.register-summary-note {
+  background: #ebf8ff;
+  border: 1px solid #bee3f8;
+  color: #2c5282;
+  font-size: 0.86rem;
+  line-height: 1.5;
 }
 
 .stock-low {
