@@ -55,7 +55,7 @@
     └── Setup.gs    # スプレッドシート4シート自動構築・トリガー初期設定スクリプト
 ```
 
-セットアップ手順
+## **セットアップ手順**
 
 ### **Step 1: Google スプレッドシート & GAS の準備**
 
@@ -77,18 +77,8 @@
 ### **Step 3: フロントエンドの設定 & GitHub Pages 公開**
 
 1. config.js を開き、GAS\_API\_URL に Step 2 でコピーしたURLを設定します。  
-2. JavaScript
-
-```
-const APP_CONFIG = {
-  GAS_API_URL: "[https://script.google.com/macros/s/あなたのデプロイID/exec](https://script.google.com/macros/s/あなたのデプロイID/exec)",
-  STAFF_POLL_INTERVAL: 30000
-};
-```
-
-3. &nbsp;  
-4. リポジトリにすべてのフロントエンドファイルをプッシュします。  
-5. GitHub リポジトリの **Settings ＞ Pages** から公開ブランチを選択し、GitHub Pages を有効化します。
+2. リポジトリにすべてのフロントエンドファイルをプッシュします。  
+3. GitHub リポジトリの **Settings ＞ Pages** から公開ブランチを選択し、GitHub Pages を有効化します。
 
 ## **データベース仕様（Google スプレッドシート）**
 
