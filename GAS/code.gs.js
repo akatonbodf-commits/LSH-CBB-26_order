@@ -1,684 +1,676 @@
 /**
- * 2026 CBB イベント物販・POSレジシステム バックエンド (GAS v3.4)
- * - ordersシートに received_amount（お預かり金額）列を追加し、一括決済時に記録
+ * 2026 CBB イベント物販・POSレジシステム バックエンドAPI (gas/Code.gs - Refactored)
  */
 
-const CACHE_TTL = 21600; // 6時間 (秒)
-const ORDER_TIMEOUT_MS = 60 * 60 * 1000; // 1時間自動キャンセル閾値
-const ORDER_HEADERS = ['id', 'created_at', 'total_price', 'status', 'updated_at', 'items', 'received_amount'];
+// ==========================================
+// 定数・シート定義・列インデックス
+// ==========================================
+const SHEET_NAMES = Object.freeze({
+  PRODUCTS: 'products',
+  ORDERS: 'orders',
+  USERS: 'users',
+  STAFFS: 'staffs'
+});
 
-function onEdit(e) {
-  clearProductCache_();
-}
+const ORDER_STATUS = Object.freeze({
+  UNPAID: 0,     // 未決済
+  PAID: 1,       // 決済済み（ピッキング待ち）
+  PICKING: 2,    // ピッキング中
+  COMPLETED: 3,  // 引き渡し完了
+  CANCELED: 4    // キャンセル済み
+});
 
-function ensureSheet_(ss, name, headers) {
-  let sheet = ss.getSheetByName(name);
-  if (!sheet) {
-    sheet = ss.insertSheet(name);
-    if (headers && headers.length > 0) {
-      sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold').setBackground('#edf2f7');
-      sheet.setFrozenRows(1);
-    }
-  } else if (headers && headers.length > 0) {
-    // 既存シートに不足している末尾ヘッダ列があれば自動補完
-    const lastCol = sheet.getLastColumn();
-    if (lastCol < headers.length) {
-      const missingHeaders = headers.slice(lastCol);
-      sheet.getRange(1, lastCol + 1, 1, missingHeaders.length)
-        .setValues([missingHeaders])
-        .setFontWeight('bold')
-        .setBackground('#edf2f7');
-    }
-  }
-  return sheet;
-}
+const ACTIVE_STOCK_STATUSES = [
+  ORDER_STATUS.UNPAID,
+  ORDER_STATUS.PAID,
+  ORDER_STATUS.PICKING,
+  ORDER_STATUS.COMPLETED
+];
 
-/**
- * GET API: ユーザー用公開データ取得 / スタッフ用管理データ取得
- */
+const COL = Object.freeze({
+  PRODUCTS: { ID: 0, NAME: 1, PRICE: 2, STOCK: 3, LIMIT: 4, IMAGE_URL: 5, STATUS: 6 },
+  ORDERS: { ID: 0, CREATED_AT: 1, TOTAL_PRICE: 2, STATUS: 3, UPDATED_AT: 4, ITEMS: 5, RECEIVED_AMOUNT: 6 },
+  USERS: { USER_ID: 0, ACCOUNT: 1, CREATED_AT: 2 },
+  STAFFS: { NAME: 0, ACCOUNT: 1, PIN: 2 }
+});
+
+const CACHE_KEY_PRODUCTS = 'public_products';
+const CACHE_TTL_SECONDS = 21600; // 6時間
+const ORDER_EXPIRE_MS = 60 * 60 * 1000; // 1時間（60分）
+
+// ==========================================
+// 1. HTTP エンドポイント (doGet / doPost)
+// ==========================================
 function doGet(e) {
-  const params = (e && e.parameter) ? e.parameter : {};
-  const action = params.action || 'public';
-
   try {
-    if (params.force === '1') {
-      clearProductCache_();
-    }
+    const params = (e && e.parameter) ? e.parameter : {};
+    const action = String(params.action || '').trim();
 
-    // ① ユーザー用注文画面向け
     if (action === 'public') {
-      const account = (params.account || '').trim().toLowerCase();
-      const products = getCachedProducts_();
-      let userInfo = null;
-      let myOrders = [];
-      let isStaff = false;
-
-      if (account) {
-        userInfo = getOrCreateUser_(account);
-        myOrders = getUserOrders_(account);
-        isStaff = isStaffAccount_(account);
-      }
-
-      return createJsonResponse_({
-        success: true,
-        message: 'データを取得しました',
-        user: userInfo,
-        isStaff: isStaff,
-        products: products,
-        myOrders: myOrders,
-        timestamp: new Date().toISOString()
-      });
+      return createJsonResponse_(handlePublic_(params));
     }
-
-    // ② スタッフ用管理画面向け（Gmail + PIN認証必須）
     if (action === 'staff') {
-      const account = (params.account || '').trim().toLowerCase();
-      const pin = String(params.pin || '').trim();
-      const staff = verifyStaffCredentials_(account, pin);
-
-      if (!staff) {
-        return createJsonResponse_({
-          success: false,
-          authError: true,
-          message: 'スタッフ認証に失敗しました。staffsシートの登録内容・パスコードを確認してください。'
-        });
-      }
-
-      const fullData = getFullAdminData_();
-      return createJsonResponse_({
-        success: true,
-        message: '管理データを取得しました',
-        staffName: staff.name,
-        products: fullData.products,
-        orders: fullData.orders,
-        users: fullData.users,
-        timestamp: new Date().toISOString()
-      });
+      return createJsonResponse_(handleStaff_(params));
     }
-
-    return createJsonResponse_({ success: false, message: '不正なアクションです' });
+    return createJsonResponse_({ success: false, message: '不明なGETアクションです。' });
   } catch (err) {
-    return createJsonResponse_({ success: false, message: 'サーバーエラー: ' + err.message });
+    return createJsonResponse_({ success: false, message: err.message || String(err) });
   }
 }
 
-/**
- * POST API: 注文確定・ユーザー単位一括決済・ユーザー単位引き渡し更新・個別ステータス更新
- */
 function doPost(e) {
-  const lock = LockService.getScriptLock();
   try {
-    const payload = JSON.parse(e.postData.contents);
-    const action = payload.action;
-
-    if (!lock.tryLock(10000)) {
-      return createJsonResponse_({ success: false, message: 'アクセスが集中しています。数秒後に再度お試しください。' });
+    if (!e || !e.postData || !e.postData.contents) {
+      return createJsonResponse_({ success: false, message: 'リクエストボディが空です。' });
     }
+    const payload = JSON.parse(e.postData.contents);
+    const action = String(payload.action || '').trim();
 
     if (action === 'createOrder') {
-      return handleCreateOrder_(payload);
-    } else if (action === 'payAllByUser') {
-      return handlePayAllByUser_(payload);
-    } else if (action === 'updateStatusByUser') {
-      return handleUpdateStatusByUser_(payload);
-    } else if (action === 'updateStatus') {
-      return handleUpdateStatus_(payload);
-    } else if (action === 'cancelExpired') {
-      const count = cancelExpiredOrdersCore_();
-      return createJsonResponse_({ success: true, message: `${count}件の期限切れ注文をキャンセルしました` });
+      return createJsonResponse_(handleCreateOrder_(payload));
+    }
+    if (action === 'payAllByUser') {
+      return createJsonResponse_(handlePayAllByUser_(payload));
+    }
+    if (action === 'updateStatusByUser') {
+      return createJsonResponse_(handleUpdateStatusByUser_(payload));
+    }
+    if (action === 'updateStatus') {
+      return createJsonResponse_(handleUpdateStatus_(payload));
     }
 
-    return createJsonResponse_({ success: false, message: '不明なリクエストです' });
-
+    return createJsonResponse_({ success: false, message: '不明なPOSTアクションです。' });
   } catch (err) {
-    return createJsonResponse_({ success: false, message: '処理中にエラーが発生しました: ' + err.message });
-  } finally {
-    if (lock.hasLock()) {
-      lock.releaseLock();
-    }
+    return createJsonResponse_({ success: false, message: err.message || String(err) });
   }
 }
 
-function getOrCreateUser_(account) {
+// ==========================================
+// 2. GET アクションハンドラ
+// ==========================================
+function handlePublic_(params) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const userSheet = ensureSheet_(ss, 'users', ['user_id', 'account', 'created_at']);
+  const account = normalizeEmail_(params.account);
+  const forceRefresh = String(params.force || '') === '1';
 
-  const rows = userSheet.getDataRange().getValues();
-  for (let i = 1; i < rows.length; i++) {
-    if (String(rows[i][1] || '').trim().toLowerCase() === account) {
-      return {
-        user_id: String(rows[i][0]).trim(),
-        account: account
-      };
-    }
+  const products = getProductsWithRealtimeStock_(ss, forceRefresh);
+
+  let userObj = null;
+  let myOrders = [];
+  let isStaff = false;
+
+  if (account) {
+    isStaff = Boolean(findStaffByAccount_(ss, account));
+    userObj = getOrCreateUser_(ss, account);
+    const allOrders = getAllOrders_(ss);
+    myOrders = allOrders.filter(o =>
+      o.account === account || (userObj && o.user_id === userObj.user_id)
+    );
   }
 
-  const nextNum = 1000 + rows.length;
-  const newUserId = 'USR-' + nextNum;
-  const nowIso = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd HH:mm:ss');
-
-  userSheet.appendRow([newUserId, account, nowIso]);
-  SpreadsheetApp.flush();
-
   return {
-    user_id: newUserId,
-    account: account
+    success: true,
+    products: products,
+    user: userObj,
+    myOrders: myOrders,
+    isStaff: isStaff
   };
 }
 
-function handleCreateOrder_(payload) {
+function handleStaff_(params) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const orderSheet = ensureSheet_(ss, 'orders', ORDER_HEADERS);
-
-  const account = (payload.account || '').trim().toLowerCase();
-  const cartItems = payload.items || [];
-
-  if (!account || cartItems.length === 0) {
-    return createJsonResponse_({ success: false, message: 'アカウントまたはカートが空です' });
+  const staff = verifyStaffCredentials_(ss, params.account, params.pin);
+  if (!staff) {
+    return {
+      success: false,
+      authError: true,
+      message: 'スタッフ認証に失敗しました。GmailアドレスとPINを確認してください。'
+    };
   }
 
-  const userInfo = getOrCreateUser_(account);
-  const latestProducts = computeProductsWithLiveStock_(ss);
-  const productMap = {};
-  latestProducts.forEach(p => { productMap[p.id] = p; });
+  const forceRefresh = String(params.force || '') === '1';
+  const products = getProductsWithRealtimeStock_(ss, forceRefresh);
+  const orders = getAllOrders_(ss);
+  const users = getAllUsers_(ss);
 
-  const now = new Date();
-  const nowIso = Utilities.formatDate(now, 'Asia/Tokyo', 'yyyy-MM-dd HH:mm:ss');
-  const orderId = 'ORD-' + Utilities.formatDate(now, 'Asia/Tokyo', 'HHmmss') + '-' + Math.floor(100 + Math.random() * 900);
-
-  let totalPrice = 0;
-  let isOutOfStock = false;
-  let errorReason = '';
-
-  for (const item of cartItems) {
-    const prod = productMap[String(item.id)];
-    const qty = Number(item.qty);
-    if (!prod || !prod.status) {
-      isOutOfStock = true;
-      errorReason = `商品「${item.name}」は現在販売停止中です`;
-      break;
-    }
-    if (qty <= 0 || qty > prod.limit) {
-      isOutOfStock = true;
-      errorReason = `商品「${prod.name}」の購入上限（${prod.limit}点）を超えています`;
-      break;
-    }
-    if (prod.stock < qty) {
-      isOutOfStock = true;
-      errorReason = `商品「${prod.name}」の在庫が不足しています（残り${prod.stock}点）`;
-      break;
-    }
-    totalPrice += prod.price * qty;
-  }
-
-  const itemsWithMeta = cartItems.map(item => ({
-    id: String(item.id),
-    name: String(item.name),
-    qty: Number(item.qty),
-    price: Number(item.price),
-    account: account,
-    user_id: userInfo.user_id
-  }));
-
-  if (isOutOfStock) {
-    orderSheet.appendRow([orderId, nowIso, totalPrice, 4, nowIso, JSON.stringify(itemsWithMeta), 0]);
-    clearProductCache_();
-    return createJsonResponse_({ success: false, message: errorReason, orderId: orderId });
-  }
-
-  // 新規注文時は未決済のため received_amount は 0 で初期化
-  orderSheet.appendRow([orderId, nowIso, totalPrice, 0, nowIso, JSON.stringify(itemsWithMeta), 0]);
-  SpreadsheetApp.flush();
-  clearProductCache_();
-
-  return createJsonResponse_({
+  return {
     success: true,
-    message: '注文が確定しました',
-    user: userInfo,
-    order: {
-      id: orderId,
-      created_at: nowIso,
-      total_price: totalPrice,
-      status: 0,
-      items: itemsWithMeta,
-      account: account,
-      user_id: userInfo.user_id,
-      received_amount: 0
+    staffName: staff.name,
+    products: products,
+    orders: orders,
+    users: users
+  };
+}
+
+// ==========================================
+// 3. POST アクションハンドラ（すべて排他制御付き）
+// ==========================================
+function handleCreateOrder_(payload) {
+  const account = normalizeEmail_(payload.account);
+  const reqItems = Array.isArray(payload.items) ? payload.items : [];
+
+  if (!account || !account.includes('@')) {
+    return { success: false, message: '有効なGmailアドレスが必要です。' };
+  }
+  if (reqItems.length === 0) {
+    return { success: false, message: '注文商品が選択されていません。' };
+  }
+
+  return withScriptLock_(() => {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const userObj = getOrCreateUser_(ss, account);
+    const latestProducts = getProductsWithRealtimeStock_(ss, true);
+    const productMap = new Map(latestProducts.map(p => [p.id, p]));
+
+    let totalPrice = 0;
+    const verifiedItems = [];
+
+    for (const item of reqItems) {
+      const pid = String(item.id || '').trim();
+      const qty = Math.floor(Number(item.qty) || 0);
+      const prod = productMap.get(pid);
+
+      if (!prod || !prod.status) {
+        return { success: false, message: `商品（ID: ${pid}）は現在販売されていません。` };
+      }
+      if (qty <= 0) {
+        return { success: false, message: `「${prod.name}」の数量が不正です。` };
+      }
+      if (qty > prod.limit) {
+        return { success: false, message: `「${prod.name}」の購入上限（${prod.limit}点）を超えています。` };
+      }
+      if (qty > prod.stock) {
+        return { success: false, message: `申し訳ありません。「${prod.name}」の在庫が不足しています（残り${prod.stock}点）。` };
+      }
+
+      totalPrice += prod.price * qty;
+      verifiedItems.push({
+        id: prod.id,
+        name: prod.name,
+        price: prod.price,
+        qty: qty
+      });
     }
+
+    const nowStr = formatDateTime_(new Date());
+    const orderId = generateOrderId_();
+    const storedPayload = JSON.stringify({
+      user_id: userObj.user_id,
+      account: account,
+      items: verifiedItems
+    });
+
+    const orderSheet = ss.getSheetByName(SHEET_NAMES.ORDERS);
+    orderSheet.appendRow([
+      orderId,
+      nowStr,
+      totalPrice,
+      ORDER_STATUS.UNPAID,
+      nowStr,
+      storedPayload,
+      0
+    ]);
+
+    invalidateProductsCache_();
+    SpreadsheetApp.flush();
+
+    return {
+      success: true,
+      orderId: orderId,
+      userId: userObj.user_id,
+      totalPrice: totalPrice,
+      message: '注文を確定しました。'
+    };
   });
 }
 
-/**
- * ユーザーの未決済注文を一括決済し、受け取った金額（received_amount）を記録する
- */
 function handlePayAllByUser_(payload) {
-  const staffAcc = (payload.account || '').trim().toLowerCase();
-  const pin = String(payload.pin || '').trim();
-  if (!verifyStaffCredentials_(staffAcc, pin)) {
-    return createJsonResponse_({ success: false, message: 'スタッフ権限がありません' });
-  }
-
-  const targetUserId = String(payload.userId || '').trim().toUpperCase();
-  if (!targetUserId) {
-    return createJsonResponse_({ success: false, message: 'ユーザーIDが指定されていません' });
-  }
-
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const userSheet = ensureSheet_(ss, 'users', ['user_id', 'account', 'created_at']);
-  const userRows = userSheet.getDataRange().getValues();
-  let targetAccount = '';
-
-  for (let i = 1; i < userRows.length; i++) {
-    if (String(userRows[i][0] || '').trim().toUpperCase() === targetUserId) {
-      targetAccount = String(userRows[i][1] || '').trim().toLowerCase();
-      break;
+  return withScriptLock_(() => {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const staff = verifyStaffCredentials_(ss, payload.account, payload.pin);
+    if (!staff) {
+      return { success: false, authError: true, message: 'スタッフ認証エラーです。' };
     }
-  }
 
-  if (!targetAccount) {
-    return createJsonResponse_({ success: false, message: `ユーザーID「${targetUserId}」が見つかりません` });
-  }
-
-  const orderSheet = ensureSheet_(ss, 'orders', ORDER_HEADERS);
-  const data = orderSheet.getDataRange().getValues();
-  const nowIso = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd HH:mm:ss');
-
-  const targetRowIndices = [];
-  let sumTotalPrice = 0;
-
-  for (let i = 1; i < data.length; i++) {
-    const status = Number(data[i][3]);
-    if (status === 0) {
-      try {
-        const items = JSON.parse(data[i][5]);
-        const orderAcc = (items.length > 0 && items[0].account) ? items[0].account.toLowerCase() : '';
-        const orderUid = (items.length > 0 && items[0].user_id) ? items[0].user_id.toUpperCase() : '';
-        if (orderUid === targetUserId || orderAcc === targetAccount) {
-          targetRowIndices.push(i);
-          sumTotalPrice += Number(data[i][2] || 0);
-        }
-      } catch (e) {}
+    const targetUid = String(payload.userId || '').trim().toUpperCase();
+    if (!targetUid) {
+      return { success: false, message: 'ユーザーIDが指定されていません。' };
     }
-  }
 
-  if (targetRowIndices.length === 0) {
-    return createJsonResponse_({ success: false, message: 'このユーザーの未決済注文は0件です' });
-  }
+    if (payload.receivedAmount === undefined || payload.receivedAmount === null || payload.receivedAmount === '') {
+      return { success: false, message: 'エラー: お預かり金額（receivedAmount）が送信されていません。' };
+    }
+    const receivedAmount = Number(payload.receivedAmount);
+    if (isNaN(receivedAmount) || receivedAmount < 0) {
+      return { success: false, message: 'お預かり金額の数値が不正です。' };
+    }
 
-  // 受け取った金額の確定（未指定または不正な場合は合計金額と同額とする）
-  const rawReceived = Number(payload.receivedAmount);
-  const receivedAmount = (!isNaN(rawReceived) && rawReceived >= sumTotalPrice) ? rawReceived : sumTotalPrice;
+    const users = getAllUsers_(ss);
+    const userObj = users.find(u => u.user_id.toUpperCase() === targetUid);
+    const targetAccount = userObj ? userObj.account : '';
 
-  targetRowIndices.forEach((rowIdx, idx) => {
-    orderSheet.getRange(rowIdx + 1, 4).setValue(1); // status -> 1 (決済済み)
-    orderSheet.getRange(rowIdx + 1, 5).setValue(nowIso); // updated_at
-    // 複数注文一括決済時は先頭行にお預かり金額を記録し、2件目以降は0を記録して重複集計を防止
-    orderSheet.getRange(rowIdx + 1, 7).setValue(idx === 0 ? receivedAmount : 0);
-  });
+    const orderSheet = ss.getSheetByName(SHEET_NAMES.ORDERS);
+    const rows = orderSheet.getDataRange().getValues();
+    const nowStr = formatDateTime_(new Date());
 
-  SpreadsheetApp.flush();
-  clearProductCache_();
+    let updatedCount = 0;
+    let sumTotalPrice = 0;
 
-  return createJsonResponse_({
-    success: true,
-    message: `${targetRowIndices.length}件の注文を一括決済完了にしました`,
-    updatedCount: targetRowIndices.length,
-    receivedAmount: receivedAmount
+    for (let i = 1; i < rows.length; i++) {
+      const parsed = parseOrderRow_(rows[i]);
+      if (!parsed.id || parsed.status !== ORDER_STATUS.UNPAID) continue;
+
+      const isTarget = (parsed.user_id.toUpperCase() === targetUid) ||
+        (targetAccount && parsed.account === targetAccount);
+
+      if (isTarget) {
+        const rowNum = i + 1;
+        const recordReceived = updatedCount === 0 ? receivedAmount : 0;
+
+        orderSheet.getRange(rowNum, COL.ORDERS.STATUS + 1).setValue(ORDER_STATUS.PAID);
+        orderSheet.getRange(rowNum, COL.ORDERS.UPDATED_AT + 1).setValue(nowStr);
+        orderSheet.getRange(rowNum, COL.ORDERS.RECEIVED_AMOUNT + 1).setValue(recordReceived);
+
+        updatedCount++;
+        sumTotalPrice += parsed.total_price;
+      }
+    }
+
+    if (updatedCount === 0) {
+      return { success: false, message: '対象の未決済注文が見つかりませんでした（すでに決済済みか期限切れの可能性があります）。' };
+    }
+
+    SpreadsheetApp.flush();
+
+    return {
+      success: true,
+      updatedCount: updatedCount,
+      totalPrice: sumTotalPrice,
+      receivedAmount: receivedAmount,
+      message: `${targetUid} の未決済注文 ${updatedCount}件（合計 ¥${sumTotalPrice.toLocaleString()}）の決済を完了しました。`
+    };
   });
 }
 
 function handleUpdateStatusByUser_(payload) {
-  const staffAcc = (payload.account || '').trim().toLowerCase();
-  const pin = String(payload.pin || '').trim();
-  if (!verifyStaffCredentials_(staffAcc, pin)) {
-    return createJsonResponse_({ success: false, message: 'スタッフ権限がありません' });
-  }
-
-  const targetUserId = String(payload.userId || '').trim().toUpperCase();
-  const nextStatus = Number(payload.nextStatus);
-
-  if (!targetUserId || (nextStatus !== 2 && nextStatus !== 3)) {
-    return createJsonResponse_({ success: false, message: 'パラメータが不正です' });
-  }
-
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const userSheet = ensureSheet_(ss, 'users', ['user_id', 'account', 'created_at']);
-  const userRows = userSheet.getDataRange().getValues();
-  let targetAccount = '';
-
-  for (let i = 1; i < userRows.length; i++) {
-    if (String(userRows[i][0] || '').trim().toUpperCase() === targetUserId) {
-      targetAccount = String(userRows[i][1] || '').trim().toLowerCase();
-      break;
+  return withScriptLock_(() => {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const staff = verifyStaffCredentials_(ss, payload.account, payload.pin);
+    if (!staff) {
+      return { success: false, authError: true, message: 'スタッフ認証エラーです。' };
     }
-  }
 
-  const orderSheet = ensureSheet_(ss, 'orders', ORDER_HEADERS);
-  const data = orderSheet.getDataRange().getValues();
-  const nowIso = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd HH:mm:ss');
-  let updatedCount = 0;
-
-  for (let i = 1; i < data.length; i++) {
-    const status = Number(data[i][3]);
-    const isTargetStatus = (nextStatus === 2) ? (status === 1) : (status === 1 || status === 2);
-    if (isTargetStatus) {
-      try {
-        const items = JSON.parse(data[i][5]);
-        const orderAcc = (items.length > 0 && items[0].account) ? items[0].account.toLowerCase() : '';
-        const orderUid = (items.length > 0 && items[0].user_id) ? items[0].user_id.toUpperCase() : '';
-        if (orderUid === targetUserId || (targetAccount && orderAcc === targetAccount)) {
-          orderSheet.getRange(i + 1, 4).setValue(nextStatus);
-          orderSheet.getRange(i + 1, 5).setValue(nowIso);
-          updatedCount++;
-        }
-      } catch (e) {}
+    const targetUid = String(payload.userId || '').trim().toUpperCase();
+    const nextStatus = Number(payload.nextStatus);
+    if (!targetUid || ![ORDER_STATUS.PICKING, ORDER_STATUS.COMPLETED].includes(nextStatus)) {
+      return { success: false, message: 'パラメータが不正です。' };
     }
-  }
 
-  if (updatedCount === 0) {
-    return createJsonResponse_({ success: false, message: '対象の注文が見つかりませんでした（すでに更新済みの可能性があります）' });
-  }
+    const users = getAllUsers_(ss);
+    const userObj = users.find(u => u.user_id.toUpperCase() === targetUid);
+    const targetAccount = userObj ? userObj.account : '';
 
-  SpreadsheetApp.flush();
-  clearProductCache_();
+    const orderSheet = ss.getSheetByName(SHEET_NAMES.ORDERS);
+    const rows = orderSheet.getDataRange().getValues();
+    const nowStr = formatDateTime_(new Date());
 
-  return createJsonResponse_({
-    success: true,
-    message: `${updatedCount}件の注文を更新しました`,
-    updatedCount: updatedCount
+    let updatedCount = 0;
+
+    for (let i = 1; i < rows.length; i++) {
+      const parsed = parseOrderRow_(rows[i]);
+      const isWaiting = parsed.status === ORDER_STATUS.PAID || parsed.status === ORDER_STATUS.PICKING;
+      if (!parsed.id || !isWaiting) continue;
+
+      const isTarget = (parsed.user_id.toUpperCase() === targetUid) ||
+        (targetAccount && parsed.account === targetAccount);
+
+      if (isTarget) {
+        const rowNum = i + 1;
+        orderSheet.getRange(rowNum, COL.ORDERS.STATUS + 1).setValue(nextStatus);
+        orderSheet.getRange(rowNum, COL.ORDERS.UPDATED_AT + 1).setValue(nowStr);
+        updatedCount++;
+      }
+    }
+
+    if (updatedCount === 0) {
+      return { success: false, message: '対象の引き渡し待ち注文が見つかりませんでした。' };
+    }
+
+    SpreadsheetApp.flush();
+
+    return {
+      success: true,
+      updatedCount: updatedCount,
+      message: `${targetUid} の注文（${updatedCount}件）を更新しました。`
+    };
   });
 }
 
 function handleUpdateStatus_(payload) {
-  const account = (payload.account || '').trim().toLowerCase();
-  const pin = String(payload.pin || '').trim();
-  if (!verifyStaffCredentials_(account, pin)) {
-    return createJsonResponse_({ success: false, message: 'スタッフ権限がありません' });
-  }
+  return withScriptLock_(() => {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const staff = verifyStaffCredentials_(ss, payload.account, payload.pin);
+    if (!staff) {
+      return { success: false, authError: true, message: 'スタッフ認証エラーです。' };
+    }
 
-  const orderId = String(payload.orderId || '').trim();
-  const nextStatus = Number(payload.status);
+    const targetOrderId = String(payload.orderId || '').trim().toUpperCase();
+    const nextStatus = Number(payload.status);
+    if (!targetOrderId || isNaN(nextStatus)) {
+      return { success: false, message: '注文IDまたはステータスが不正です。' };
+    }
 
-  if (!orderId || isNaN(nextStatus) || nextStatus < 0 || nextStatus > 4) {
-    return createJsonResponse_({ success: false, message: 'パラメータが不正です' });
-  }
+    const orderSheet = ss.getSheetByName(SHEET_NAMES.ORDERS);
+    const rows = orderSheet.getDataRange().getValues();
+    const nowStr = formatDateTime_(new Date());
 
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const orderSheet = ensureSheet_(ss, 'orders', ORDER_HEADERS);
-  const data = orderSheet.getDataRange().getValues();
-  const nowIso = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd HH:mm:ss');
+    for (let i = 1; i < rows.length; i++) {
+      const rowOrderId = String(rows[i][COL.ORDERS.ID] || '').trim().toUpperCase();
+      if (rowOrderId === targetOrderId) {
+        const rowNum = i + 1;
+        orderSheet.getRange(rowNum, COL.ORDERS.STATUS + 1).setValue(nextStatus);
+        orderSheet.getRange(rowNum, COL.ORDERS.UPDATED_AT + 1).setValue(nowStr);
 
-  for (let i = 1; i < data.length; i++) {
-    if (String(data[i][0]) === orderId) {
-      const currentStatus = Number(data[i][3]);
-      if (currentStatus === 4 && nextStatus !== 4) {
-        return createJsonResponse_({ success: false, message: 'すでにキャンセル済みの注文です' });
+        if (nextStatus === ORDER_STATUS.CANCELED) {
+          invalidateProductsCache_();
+        }
+        SpreadsheetApp.flush();
+
+        return {
+          success: true,
+          message: `注文 ${targetOrderId} のステータスを更新しました。`
+        };
       }
-      orderSheet.getRange(i + 1, 4).setValue(nextStatus);
-      orderSheet.getRange(i + 1, 5).setValue(nowIso);
-
-      SpreadsheetApp.flush();
-      clearProductCache_();
-
-      return createJsonResponse_({
-        success: true,
-        message: 'ステータスを更新しました',
-        orderId: orderId,
-        status: nextStatus
-      });
     }
-  }
 
-  return createJsonResponse_({ success: false, message: '該当する注文IDが見つかりません' });
+    return { success: false, message: `注文ID「${targetOrderId}」が見つかりません。` };
+  });
 }
 
+// ==========================================
+// 4. 時間主導・編集トリガー処理
+// ==========================================
 function autoCancelExpiredOrders() {
-  const lock = LockService.getScriptLock();
-  try {
-    if (lock.tryLock(10000)) {
-      cancelExpiredOrdersCore_();
-    }
-  } finally {
-    if (lock.hasLock()) {
-      lock.releaseLock();
-    }
-  }
-}
+  withScriptLock_(() => {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const orderSheet = ss.getSheetByName(SHEET_NAMES.ORDERS);
+    if (!orderSheet) return;
 
-function cancelExpiredOrdersCore_() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const orderSheet = ensureSheet_(ss, 'orders', ORDER_HEADERS);
-  const data = orderSheet.getDataRange().getValues();
-  const now = new Date();
-  const nowIso = Utilities.formatDate(now, 'Asia/Tokyo', 'yyyy-MM-dd HH:mm:ss');
-  let canceledCount = 0;
+    const rows = orderSheet.getDataRange().getValues();
+    const now = new Date();
+    const nowStr = formatDateTime_(now);
+    let canceledCount = 0;
 
-  for (let i = 1; i < data.length; i++) {
-    const status = Number(data[i][3]);
-    if (status === 0) {
-      const createdAt = new Date(data[i][1]);
-      if (!isNaN(createdAt.getTime()) && (now.getTime() - createdAt.getTime() >= ORDER_TIMEOUT_MS)) {
-        orderSheet.getRange(i + 1, 4).setValue(4);
-        orderSheet.getRange(i + 1, 5).setValue(nowIso);
+    for (let i = 1; i < rows.length; i++) {
+      const status = Number(rows[i][COL.ORDERS.STATUS]);
+      if (status !== ORDER_STATUS.UNPAID) continue;
+
+      const createdRaw = rows[i][COL.ORDERS.CREATED_AT];
+      const createdDate = createdRaw instanceof Date ? createdRaw : new Date(String(createdRaw));
+      if (isNaN(createdDate.getTime())) continue;
+
+      if (now.getTime() - createdDate.getTime() >= ORDER_EXPIRE_MS) {
+        const rowNum = i + 1;
+        orderSheet.getRange(rowNum, COL.ORDERS.STATUS + 1).setValue(ORDER_STATUS.CANCELED);
+        orderSheet.getRange(rowNum, COL.ORDERS.UPDATED_AT + 1).setValue(nowStr);
         canceledCount++;
       }
     }
-  }
 
-  if (canceledCount > 0) {
-    SpreadsheetApp.flush();
-    clearProductCache_();
-  }
-  return canceledCount;
+    if (canceledCount > 0) {
+      invalidateProductsCache_();
+      SpreadsheetApp.flush();
+    }
+  });
 }
 
-function getCachedProducts_() {
+function onEdit(e) {
+  if (!e || !e.range) return;
+  const sheetName = e.range.getSheet().getName();
+  if (sheetName === SHEET_NAMES.PRODUCTS || sheetName === SHEET_NAMES.ORDERS) {
+    invalidateProductsCache_();
+  }
+}
+
+// ==========================================
+// 5. データアクセス・行データ変換（マッピング層）
+// ==========================================
+function getProductsWithRealtimeStock_(ss, forceRefresh = false) {
   const cache = CacheService.getScriptCache();
-  const cached = cache.get('public_products');
-  if (cached) {
-    return JSON.parse(cached);
-  }
-
-  const lock = LockService.getScriptLock();
-  try {
-    if (lock.tryLock(10000)) {
-      const recheck = cache.get('public_products');
-      if (recheck) {
-        return JSON.parse(recheck);
-      }
-      const ss = SpreadsheetApp.getActiveSpreadsheet();
-      const products = computeProductsWithLiveStock_(ss);
-      cache.put('public_products', JSON.stringify(products), CACHE_TTL);
-      return products;
-    } else {
-      return computeProductsWithLiveStock_(SpreadsheetApp.getActiveSpreadsheet());
-    }
-  } finally {
-    if (lock.hasLock()) {
-      lock.releaseLock();
-    }
-  }
-}
-
-function computeProductsWithLiveStock_(ss) {
-  const productSheet = ensureSheet_(ss, 'products', ['id', 'name', 'price', 'stock', 'limit', 'image_url', 'status']);
-  const orderSheet = ensureSheet_(ss, 'orders', ORDER_HEADERS);
-
-  const productRows = productSheet.getDataRange().getValues();
-  const orderRows = orderSheet.getDataRange().getValues();
-
-  const reservedMap = {};
-  for (let i = 1; i < orderRows.length; i++) {
-    const r = orderRows[i];
-    if (!r[0]) continue;
-    const status = Number(r[3]);
-    if (status >= 0 && status <= 3) {
+  if (!forceRefresh) {
+    const cached = cache.get(CACHE_KEY_PRODUCTS);
+    if (cached) {
       try {
-        const items = JSON.parse(r[5]);
-        items.forEach(item => {
-          const pid = String(item.id).trim();
-          reservedMap[pid] = (reservedMap[pid] || 0) + Number(item.qty || 0);
-        });
-      } catch (e) {}
+        return JSON.parse(cached);
+      } catch (e) {
+        // キャッシュ破損時は再計算へフォールバック
+      }
     }
   }
 
-  const products = [];
-  const seenIds = new Set();
+  const productSheet = ss.getSheetByName(SHEET_NAMES.PRODUCTS);
+  if (!productSheet) return [];
 
-  for (let i = 1; i < productRows.length; i++) {
-    const r = productRows[i];
-    if (!r[0] && !r[1]) continue;
+  const allOrders = getAllOrders_(ss);
+  const reservedQtyMap = {};
 
-    let id = String(r[0] || '').trim();
-    if (!id || seenIds.has(id)) {
-      id = (id || 'ITEM') + '_ROW' + (i + 1);
-    }
-    seenIds.add(id);
-
-    const initialStock = Math.max(0, Number(r[3]) || 0);
-    const reserved = reservedMap[id] || 0;
-    const remainingStock = Math.max(0, initialStock - reserved);
-    const limitNum = Math.max(1, Number(r[4]) || 1);
-
-    const rawStatus = r[6];
-    const isActive = (rawStatus === true || String(rawStatus).toUpperCase() === 'TRUE' || Number(rawStatus) === 1);
-
-    products.push({
-      id: id,
-      name: String(r[1] || '名称未設定'),
-      price: Math.max(0, Number(r[2]) || 0),
-      stock: remainingStock,
-      limit: limitNum,
-      image_url: convertDriveUrl_(String(r[5] || '')),
-      status: isActive
+  allOrders.forEach(order => {
+    if (!ACTIVE_STOCK_STATUSES.includes(order.status)) return;
+    order.items.forEach(item => {
+      reservedQtyMap[item.id] = (reservedQtyMap[item.id] || 0) + item.qty;
     });
-  }
-  return products;
-}
+  });
 
-function getUserOrders_(account) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const orderSheet = ensureSheet_(ss, 'orders', ORDER_HEADERS);
-  const orderRows = orderSheet.getDataRange().getValues();
+  const pRows = productSheet.getDataRange().getValues();
   const result = [];
 
-  for (let i = 1; i < orderRows.length; i++) {
-    const r = orderRows[i];
-    if (!r[0]) continue;
-    const status = Number(r[3]);
-    if (status === 4) continue;
+  for (let i = 1; i < pRows.length; i++) {
+    const prod = parseProductRow_(pRows[i]);
+    if (!prod.id && !prod.name) continue;
 
-    try {
-      const items = JSON.parse(r[5]);
-      const orderAccount = (items.length > 0 && items[0].account) ? items[0].account.toLowerCase() : '';
-      const userId = (items.length > 0 && items[0].user_id) ? items[0].user_id : '';
-      if (orderAccount === account) {
-        result.push({
-          id: String(r[0]),
-          created_at: r[1] instanceof Date ? Utilities.formatDate(r[1], 'Asia/Tokyo', 'yyyy-MM-dd HH:mm:ss') : String(r[1]),
-          total_price: Number(r[2]),
-          status: status,
-          items: items,
-          account: orderAccount,
-          user_id: userId,
-          received_amount: Number(r[6] || 0)
-        });
-      }
-    } catch (e) {}
+    const reserved = reservedQtyMap[prod.id] || 0;
+    prod.stock = Math.max(0, prod.initial_stock - reserved);
+    result.push(prod);
   }
+
+  try {
+    cache.put(CACHE_KEY_PRODUCTS, JSON.stringify(result), CACHE_TTL_SECONDS);
+  } catch (e) {
+    // キャッシュ上限超過時は無視
+  }
+
   return result;
 }
 
-function getFullAdminData_() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const products = computeProductsWithLiveStock_(ss);
+function parseProductRow_(row) {
+  const rawStatus = row[COL.PRODUCTS.STATUS];
+  const isActive = (rawStatus === true || String(rawStatus).toUpperCase() === 'TRUE' || Number(rawStatus) === 1);
 
-  const userSheet = ensureSheet_(ss, 'users', ['user_id', 'account', 'created_at']);
-  const userRows = userSheet.getDataRange().getValues();
-  const users = [];
-  const accToUid = {};
-  for (let i = 1; i < userRows.length; i++) {
-    if (!userRows[i][0]) continue;
-    const uid = String(userRows[i][0]).trim();
-    const acc = String(userRows[i][1] || '').trim().toLowerCase();
-    users.push({ user_id: uid, account: acc });
-    accToUid[acc] = uid;
-  }
-
-  const orderSheet = ensureSheet_(ss, 'orders', ORDER_HEADERS);
-  const orderRows = orderSheet.getDataRange().getValues();
-  const orders = [];
-
-  for (let i = 1; i < orderRows.length; i++) {
-    const r = orderRows[i];
-    if (!r[0]) continue;
-    let parsedItems = [];
-    try {
-      parsedItems = JSON.parse(r[5]);
-    } catch (e) {}
-    const account = (parsedItems.length > 0 && parsedItems[0].account) ? parsedItems[0].account.toLowerCase() : '';
-    const userId = (parsedItems.length > 0 && parsedItems[0].user_id) ? parsedItems[0].user_id : (accToUid[account] || '');
-
-    orders.push({
-      id: String(r[0]),
-      created_at: r[1] instanceof Date ? Utilities.formatDate(r[1], 'Asia/Tokyo', 'yyyy-MM-dd HH:mm:ss') : String(r[1]),
-      total_price: Number(r[2]),
-      status: Number(r[3]),
-      updated_at: r[4] instanceof Date ? Utilities.formatDate(r[4], 'Asia/Tokyo', 'yyyy-MM-dd HH:mm:ss') : String(r[4]),
-      items: parsedItems,
-      account: account,
-      user_id: userId,
-      received_amount: Number(r[6] || 0)
-    });
-  }
-  return { products, orders, users };
+  return {
+    id: String(row[COL.PRODUCTS.ID] || '').trim(),
+    name: String(row[COL.PRODUCTS.NAME] || '').trim(),
+    price: Number(row[COL.PRODUCTS.PRICE]) || 0,
+    initial_stock: Number(row[COL.PRODUCTS.STOCK]) || 0,
+    stock: 0,
+    limit: Math.max(1, Number(row[COL.PRODUCTS.LIMIT]) || 1),
+    image_url: String(row[COL.PRODUCTS.IMAGE_URL] || '').trim(),
+    status: isActive
+  };
 }
 
-function isStaffAccount_(account) {
-  if (!account) return false;
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const staffSheet = ensureSheet_(ss, 'staffs', ['name', 'account', 'pin']);
-  const rows = staffSheet.getDataRange().getValues();
+function getAllOrders_(ss) {
+  const orderSheet = ss.getSheetByName(SHEET_NAMES.ORDERS);
+  if (!orderSheet) return [];
 
+  const rows = orderSheet.getDataRange().getValues();
+  const orders = [];
   for (let i = 1; i < rows.length; i++) {
-    const rowAccount = String(rows[i][1] || '').trim().toLowerCase();
-    if (rowAccount === account) {
-      return true;
+    const parsed = parseOrderRow_(rows[i]);
+    if (parsed.id) orders.push(parsed);
+  }
+  return orders;
+}
+
+function parseOrderRow_(row) {
+  const rawItems = String(row[COL.ORDERS.ITEMS] || '').trim();
+  let account = '';
+  let userId = '';
+  let items = [];
+
+  if (rawItems) {
+    try {
+      const parsedJson = JSON.parse(rawItems);
+      if (Array.isArray(parsedJson)) {
+        items = parsedJson;
+      } else if (parsedJson && typeof parsedJson === 'object') {
+        account = normalizeEmail_(parsedJson.account);
+        userId = String(parsedJson.user_id || '').trim();
+        items = Array.isArray(parsedJson.items) ? parsedJson.items : [];
+      }
+    } catch (e) {
+      items = [];
     }
   }
-  return false;
+
+  return {
+    id: String(row[COL.ORDERS.ID] || '').trim(),
+    created_at: formatCellDate_(row[COL.ORDERS.CREATED_AT]),
+    total_price: Number(row[COL.ORDERS.TOTAL_PRICE]) || 0,
+    status: Number(row[COL.ORDERS.STATUS]),
+    updated_at: formatCellDate_(row[COL.ORDERS.UPDATED_AT]),
+    account: account,
+    user_id: userId,
+    items: items.map(it => ({
+      id: String(it.id || '').trim(),
+      name: String(it.name || '').trim(),
+      price: Number(it.price) || 0,
+      qty: Number(it.qty) || 0
+    })),
+    received_amount: Number(row[COL.ORDERS.RECEIVED_AMOUNT]) || 0
+  };
 }
 
-function verifyStaffCredentials_(account, pin) {
-  if (!account || !pin) return null;
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const staffSheet = ensureSheet_(ss, 'staffs', ['name', 'account', 'pin']);
-  const rows = staffSheet.getDataRange().getValues();
+function getAllUsers_(ss) {
+  const userSheet = ss.getSheetByName(SHEET_NAMES.USERS);
+  if (!userSheet) return [];
 
+  const rows = userSheet.getDataRange().getValues();
+  const users = [];
   for (let i = 1; i < rows.length; i++) {
-    const r = rows[i];
-    if (!r[1]) continue;
-    const rowAccount = String(r[1]).trim().toLowerCase();
-    const rowPin = String(r[2] || '').trim();
-    if (rowAccount === account && rowPin === pin) {
-      return { name: String(r[0] || 'スタッフ'), account: rowAccount };
+    const parsed = parseUserRow_(rows[i]);
+    if (parsed.user_id && parsed.account) users.push(parsed);
+  }
+  return users;
+}
+
+function parseUserRow_(row) {
+  return {
+    user_id: String(row[COL.USERS.USER_ID] || '').trim(),
+    account: normalizeEmail_(row[COL.USERS.ACCOUNT]),
+    created_at: formatCellDate_(row[COL.USERS.CREATED_AT])
+  };
+}
+
+function getOrCreateUser_(ss, account) {
+  const normalized = normalizeEmail_(account);
+  const existingUsers = getAllUsers_(ss);
+  const found = existingUsers.find(u => u.account === normalized);
+  if (found) return found;
+
+  return withScriptLock_(() => {
+    const refreshedUsers = getAllUsers_(ss);
+    const rechecked = refreshedUsers.find(u => u.account === normalized);
+    if (rechecked) return rechecked;
+
+    let maxNum = 1000;
+    refreshedUsers.forEach(u => {
+      const m = u.user_id.match(/^USR-(\d+)$/i);
+      if (m) {
+        const num = Number(m[1]);
+        if (num > maxNum) maxNum = num;
+      }
+    });
+
+    const newUserId = `USR-${maxNum + 1}`;
+    const nowStr = formatDateTime_(new Date());
+    const userSheet = ss.getSheetByName(SHEET_NAMES.USERS);
+    userSheet.appendRow([newUserId, normalized, nowStr]);
+    SpreadsheetApp.flush();
+
+    return {
+      user_id: newUserId,
+      account: normalized,
+      created_at: nowStr
+    };
+  });
+}
+
+// ==========================================
+// 6. スタッフ認証・共通ヘルパー
+// ==========================================
+function findStaffByAccount_(ss, account) {
+  const normalized = normalizeEmail_(account);
+  if (!normalized) return null;
+
+  const staffSheet = ss.getSheetByName(SHEET_NAMES.STAFFS);
+  if (!staffSheet) return null;
+
+  const rows = staffSheet.getDataRange().getValues();
+  for (let i = 1; i < rows.length; i++) {
+    const rowAcc = normalizeEmail_(rows[i][COL.STAFFS.ACCOUNT]);
+    if (rowAcc === normalized) {
+      return {
+        name: String(rows[i][COL.STAFFS.NAME] || 'スタッフ').trim(),
+        account: rowAcc,
+        pin: String(rows[i][COL.STAFFS.PIN] || '').trim()
+      };
     }
   }
   return null;
 }
 
-function clearProductCache_() {
-  CacheService.getScriptCache().remove('public_products');
+function verifyStaffCredentials_(ss, account, pin) {
+  const staff = findStaffByAccount_(ss, account);
+  if (!staff) return null;
+  const inputPin = String(pin || '').trim();
+  if (!inputPin || staff.pin !== inputPin) return null;
+  return staff;
 }
 
-function convertDriveUrl_(url) {
-  if (!url) return '';
-  const match = url.match(/(?:\/d\/|id=)([a-zA-Z0-9_-]{25,})/);
-  if (match && match[1]) {
-    return 'https://lh3.googleusercontent.com/d/' + match[1];
+function withScriptLock_(callback) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    throw new Error('現在アクセスが集中しています。数秒おいてから再度お試しください。');
   }
-  return url;
+  try {
+    return callback();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function invalidateProductsCache_() {
+  CacheService.getScriptCache().remove(CACHE_KEY_PRODUCTS);
+}
+
+function normalizeEmail_(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function generateOrderId_() {
+  const ts = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'HHmmss');
+  const rand = Math.floor(100 + Math.random() * 900);
+  return `ORD-${ts}${rand}`;
+}
+
+function formatDateTime_(dateObj) {
+  return Utilities.formatDate(dateObj, 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss');
+}
+
+function formatCellDate_(val) {
+  if (!val) return '';
+  if (val instanceof Date) return formatDateTime_(val);
+  return String(val).trim();
 }
 
 function createJsonResponse_(obj) {
