@@ -1,7 +1,13 @@
 /**
- * 2026 CBB イベント物販・POSレジシステム スタッフ管理画面スクリプト (js/staff.js - Refactored)
+ * 2026 CBB イベント物販・POSレジシステム スタッフ管理画面スクリプト (js/staff.js v3.6)
+ * - レジ金種クイックボタン（ちょうど / +1,000 / +5,000 / +10,000 / クリア）
+ * - 完了済み履歴の簡易確認（最新10件）＆誤完了時の差し戻し
+ * - ダッシュボードへのレジ締め集計（総売上・お預かり総額・お釣り総額）
  */
 
+// ==========================================
+// グローバル状態管理
+// ==========================================
 let staffAccount = "";
 let staffPin = "";
 let staffName = "";
@@ -32,13 +38,26 @@ let pollTimerId = null;
 window.addEventListener("DOMContentLoaded", initStaffPage);
 window.addEventListener("beforeunload", stopCamera);
 
+function bindEnterKey(elementId, callback) {
+  const el = document.getElementById(elementId);
+  if (!el) return;
+  el.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.isComposing) {
+      e.preventDefault();
+      callback();
+    }
+  });
+}
+
 async function initStaffPage() {
   bindEnterKey("auth-gmail", submitStaffAuth);
   bindEnterKey("auth-pin", submitStaffAuth);
   bindEnterKey("manual-user-id", searchUserManual);
   bindEnterKey("pos-deposit", () => {
     const payBtn = document.getElementById("btn-complete-pay");
-    if (payBtn && !payBtn.disabled) completeBatchPayment();
+    if (payBtn && !payBtn.disabled) {
+      completeBatchPayment();
+    }
   });
 
   const savedAccount = (localStorage.getItem("cbb_user_account") || "").trim().toLowerCase();
@@ -117,6 +136,7 @@ async function submitStaffAuth() {
       () => refreshAll({ isManual: false, silent: true }),
       APP_CONFIG.STAFF_POLL_INTERVAL
     );
+
   } catch (err) {
     sessionStorage.removeItem("cbb_staff_account");
     sessionStorage.removeItem("cbb_staff_pin");
@@ -205,7 +225,7 @@ function switchTab(tabName, btn) {
 }
 
 // ==========================================
-// 2. レジ決済（POS）・軽量カメラQRスキャン＆金種ボタン
+// 2. レジ決済（POS）・軽量ライブカメラQRスキャン＆金種ボタン機能
 // ==========================================
 async function toggleCamera() {
   if (scanning) {
@@ -267,8 +287,9 @@ function stopCamera() {
     videoStream = null;
   }
   const video = document.getElementById("qr-video");
-  if (video) video.srcObject = null;
-
+  if (video) {
+    video.srcObject = null;
+  }
   const btn = document.getElementById("btn-toggle-cam");
   if (btn) {
     btn.disabled = false;
@@ -307,14 +328,19 @@ function processVideoFrame() {
 
     scanCtx.drawImage(video, 0, 0, w, h);
     const imageData = scanCtx.getImageData(0, 0, w, h);
-    const code = jsQR(imageData.data, w, h, { inversionAttempts: "dontInvert" });
+
+    const code = jsQR(imageData.data, w, h, {
+      inversionAttempts: "dontInvert"
+    });
 
     if (code && code.data) {
       const scannedCode = code.data.trim().toUpperCase();
       const now = Date.now();
+
       if (scannedCode !== lastScannedCode || now - lastScannedTime > 3000) {
         lastScannedCode = scannedCode;
         lastScannedTime = now;
+
         document.getElementById("manual-user-id").value = scannedCode;
         searchUserManual();
       }
@@ -362,11 +388,11 @@ function loadUserOrdersIntoPos(userId, resetDeposit = true) {
   if (!userObj) return;
 
   selectedPosUserId = userObj.user_id;
-  document.getElementById("pos-checkout-card").style.display = "block";
+  const card = document.getElementById("pos-checkout-card");
+  card.style.display = "block";
 
   const unpaidOrders = orders.filter(
-    o => o.status === ORDER_STATUS.UNPAID &&
-      (o.user_id.toUpperCase() === targetUid || o.account === userObj.account)
+    o => o.status === 0 && (o.user_id.toUpperCase() === targetUid || o.account === userObj.account)
   );
 
   document.getElementById("pos-user-id").textContent = `ユーザーID: ${userObj.user_id}`;
@@ -398,24 +424,46 @@ function loadUserOrdersIntoPos(userId, resetDeposit = true) {
     <div style="font-weight:bold; margin-bottom:4px;">一括精算対象の注文（${unpaidOrders.length}件）:</div>
     ${unpaidOrders.map(o => `
       <div class="target-order-row">
-        <span><strong>${escapeHtml(o.id)}</strong>（¥${Number(o.total_price).toLocaleString()} / ${escapeHtml(o.created_at)}）</span>
-        <button type="button" class="btn btn-danger-outline" onclick="cancelSingleOrderFromPos('${escapeHtml(o.id)}')">この注文のみ取消</button>
+        <span><strong>${o.id}</strong>（¥${Number(o.total_price).toLocaleString()} / ${o.created_at}）</span>
+        <button type="button" class="btn btn-danger-outline" onclick="cancelSingleOrderFromPos('${o.id}')">この注文のみ取消</button>
       </div>
     `).join("")}
   `;
 
-  const totalPrice = unpaidOrders.reduce((sum, o) => sum + Number(o.total_price || 0), 0);
-  const aggregatedItems = aggregateOrderItems(unpaidOrders);
+  let totalPrice = 0;
+  const aggregatedMap = new Map();
 
-  currentPosUnpaidTotal = totalPrice;
-  tbody.innerHTML = aggregatedItems.map(item => `
+  unpaidOrders.forEach(o => {
+    totalPrice += Number(o.total_price || 0);
+    (o.items || []).forEach(i => {
+      const key = String(i.id || i.name);
+      const price = Number(i.price || 0);
+      const qty = Number(i.qty || 0);
+      if (!aggregatedMap.has(key)) {
+        aggregatedMap.set(key, {
+          name: i.name,
+          price: price,
+          qty: 0,
+          subtotal: 0
+        });
+      }
+      const entry = aggregatedMap.get(key);
+      entry.qty += qty;
+      entry.subtotal += price * qty;
+    });
+  });
+
+  const allRowsHtml = Array.from(aggregatedMap.values()).map(item => `
     <tr>
-      <td><strong>${escapeHtml(item.name)}</strong></td>
+      <td><strong>${item.name}</strong></td>
       <td>¥${item.price.toLocaleString()}</td>
       <td><strong>${item.qty}点</strong></td>
       <td>¥${item.subtotal.toLocaleString()}</td>
     </tr>
-  `).join("");
+  `);
+
+  currentPosUnpaidTotal = totalPrice;
+  tbody.innerHTML = allRowsHtml.join("");
   document.getElementById("pos-total-price").textContent = totalPrice.toLocaleString();
 
   if (resetDeposit) {
@@ -431,6 +479,7 @@ function loadUserOrdersIntoPos(userId, resetDeposit = true) {
   payBtn.textContent = `現金で一括会計（${unpaidOrders.length}件・決済完了）`;
 }
 
+// 金種クイックボタン制御
 function setExactDeposit() {
   if (currentPosUnpaidTotal <= 0) return;
   document.getElementById("pos-deposit").value = currentPosUnpaidTotal;
@@ -439,7 +488,8 @@ function setExactDeposit() {
 
 function addDepositAmount(amount) {
   const input = document.getElementById("pos-deposit");
-  input.value = (Number(input.value) || 0) + amount;
+  const current = Number(input.value) || 0;
+  input.value = current + amount;
   calcChange();
 }
 
@@ -457,7 +507,8 @@ function calcChange() {
     return;
   }
 
-  const change = Number(depositVal) - currentPosUnpaidTotal;
+  const deposit = Number(depositVal);
+  const change = deposit - currentPosUnpaidTotal;
   document.getElementById("pos-change").textContent = change >= 0 ? change.toLocaleString() : "金額不足";
 }
 
@@ -512,7 +563,7 @@ async function cancelSingleOrderFromPos(orderId) {
         account: staffAccount,
         pin: staffPin,
         orderId: orderId,
-        status: ORDER_STATUS.CANCELED
+        status: 4
       },
       { loadingText: "注文をキャンセルしています..." }
     );
@@ -525,12 +576,10 @@ async function cancelSingleOrderFromPos(orderId) {
 }
 
 // ==========================================
-// 3. 商品引き渡し（ピッキング）＆完了済み履歴確認
+// 3. 商品引き渡し（ピッキング）＆完了済み履歴確認機能
 // ==========================================
 function buildHandoverUserGroups() {
-  const waitingOrders = orders.filter(
-    o => o.status === ORDER_STATUS.PAID || o.status === ORDER_STATUS.PICKING
-  );
+  const waitingOrders = orders.filter(o => o.status === 1 || o.status === 2);
   const groupMap = new Map();
 
   waitingOrders.forEach(o => {
@@ -540,20 +589,28 @@ function buildHandoverUserGroups() {
         userId: uid,
         account: o.account || "",
         orders: [],
-        hasUnstarted: false
+        hasUnstarted: false,
+        aggregatedItems: new Map()
       });
     }
 
     const group = groupMap.get(uid);
     group.orders.push(o);
-    if (o.status === ORDER_STATUS.PAID) {
+    if (o.status === 1) {
       group.hasUnstarted = true;
     }
-  });
 
-  // 共通関数でユーザーごとの全注文明細を商品別に合算
-  groupMap.forEach(group => {
-    group.aggregatedItems = aggregateOrderItems(group.orders);
+    (o.items || []).forEach(i => {
+      const itemKey = String(i.id || i.name);
+      const qty = Number(i.qty || 0);
+      if (!group.aggregatedItems.has(itemKey)) {
+        group.aggregatedItems.set(itemKey, {
+          name: i.name,
+          qty: 0
+        });
+      }
+      group.aggregatedItems.get(itemKey).qty += qty;
+    });
   });
 
   return Array.from(groupMap.values());
@@ -576,10 +633,10 @@ function renderHandoverList() {
     const orderCountNote = g.orders.length > 1 ? `（注文${g.orders.length}件合算）` : "";
 
     return `
-      <div class="order-list-item ${isSelected ? "selected" : ""}" onclick="selectHandoverUser('${escapeHtml(g.userId)}')">
+      <div class="order-list-item ${isSelected ? "selected" : ""}" onclick="selectHandoverUser('${g.userId}')">
         <div>
-          <strong>${escapeHtml(g.userId)}</strong> <span style="font-size:0.78rem; color:#2b6cb0; font-weight:bold;">${orderCountNote}</span>
-          <div style="font-size:0.78rem; color:#718096;">${escapeHtml(g.account)}</div>
+          <strong>${g.userId}</strong> <span style="font-size:0.78rem; color:#2b6cb0; font-weight:bold;">${orderCountNote}</span>
+          <div style="font-size:0.78rem; color:#718096;">${g.account}</div>
         </div>
         <span class="status-pill" style="background:${badgeColor};">${badgeLabel}</span>
       </div>
@@ -597,30 +654,29 @@ function selectHandoverUser(userId) {
   renderHandoverList();
 
   const area = document.getElementById("picking-detail-area");
-  const itemsHtml = group.aggregatedItems.map(i => `
+  const itemsHtml = Array.from(group.aggregatedItems.values()).map(i => `
     <tr>
-      <td><strong>${escapeHtml(i.name)}</strong></td>
+      <td><strong>${i.name}</strong></td>
       <td><strong>${i.qty}点</strong></td>
     </tr>
   `).join("");
 
-  const targetOrderIds = group.orders.map(o => escapeHtml(o.id)).join(", ");
-  const safeUid = escapeHtml(group.userId);
+  const targetOrderIds = group.orders.map(o => o.id).join(", ");
 
   const actionButtonHtml = group.hasUnstarted
-    ? `<button type="button" class="btn btn-warning" onclick="updateHandoverUserStatus('${safeUid}', ${ORDER_STATUS.PICKING})">
+    ? `<button type="button" class="btn btn-warning" onclick="updateHandoverUserStatus('${group.userId}', 2)">
          ピッキング開始（引き渡し中へ）
        </button>`
-    : `<button type="button" class="btn btn-success" style="padding:12px 16px; font-size:1rem;" onclick="updateHandoverUserStatus('${safeUid}', ${ORDER_STATUS.COMPLETED})">
+    : `<button type="button" class="btn btn-success" style="padding:12px 16px; font-size:1rem;" onclick="updateHandoverUserStatus('${group.userId}', 3)">
          引き渡し完了
        </button>`;
 
   area.innerHTML = `
     <div style="margin-bottom:12px;">
       <div style="font-size:1.3rem; font-weight:bold; color:var(--primary);">
-        呼び出し番号: ${safeUid}
+        呼び出し番号: ${group.userId}
       </div>
-      <div style="font-size:0.85rem; color:#4a5568; margin-top:2px;">顧客: ${escapeHtml(group.account)}</div>
+      <div style="font-size:0.85rem; color:#4a5568; margin-top:2px;">顧客: ${group.account}</div>
       <div style="font-size:0.78rem; color:#718096; margin-top:2px;">対象注文（${group.orders.length}件合算）: ${targetOrderIds}</div>
     </div>
     <table>
@@ -630,14 +686,18 @@ function selectHandoverUser(userId) {
           <th>合計数量</th>
         </tr>
       </thead>
-      <tbody>${itemsHtml}</tbody>
+      <tbody>
+        ${itemsHtml}
+      </tbody>
     </table>
-    <div class="picking-actions">${actionButtonHtml}</div>
+    <div class="picking-actions">
+      ${actionButtonHtml}
+    </div>
   `;
 }
 
 async function updateHandoverUserStatus(userId, nextStatus) {
-  const loadingMsg = nextStatus === ORDER_STATUS.PICKING
+  const loadingMsg = nextStatus === 2
     ? "ピッキング開始を記録しています..."
     : "引き渡し完了を記録しています...";
 
@@ -653,15 +713,15 @@ async function updateHandoverUserStatus(userId, nextStatus) {
       { loadingText: loadingMsg }
     );
 
-    if (nextStatus === ORDER_STATUS.COMPLETED) {
+    if (nextStatus === 3) {
       selectedHandoverUserId = "";
       document.getElementById("picking-detail-area").innerHTML =
-        `<p class="empty-placeholder" style="color:var(--success); font-weight:bold;">${escapeHtml(userId)} 様への引き渡しが完了しました！</p>`;
+        `<p class="empty-placeholder" style="color:var(--success); font-weight:bold;">${userId} 様への引き渡しが完了しました！</p>`;
     }
 
     await refreshAll({ isManual: false, silent: false, loadingText: "一覧を更新中..." });
 
-    if (nextStatus === ORDER_STATUS.PICKING) {
+    if (nextStatus === 2) {
       selectHandoverUser(userId);
     }
   } catch (err) {
@@ -669,12 +729,15 @@ async function updateHandoverUserStatus(userId, nextStatus) {
   }
 }
 
+/**
+ * 直近の引き渡し完了履歴（status === 3 の最新10件）を表示
+ */
 function renderCompletedHistory() {
   const container = document.getElementById("completed-history-list");
   if (!container) return;
 
   const completedOrders = orders
-    .filter(o => o.status === ORDER_STATUS.COMPLETED)
+    .filter(o => o.status === 3)
     .sort((a, b) => String(b.updated_at || b.created_at).localeCompare(String(a.updated_at || a.created_at)))
     .slice(0, 10);
 
@@ -684,20 +747,20 @@ function renderCompletedHistory() {
   }
 
   container.innerHTML = completedOrders.map(o => {
-    const uidLabel = o.user_id ? `${escapeHtml(o.user_id)} / ` : "";
+    const uidLabel = o.user_id ? `${o.user_id} / ` : "";
     const itemsSummary = (o.items || [])
-      .map(i => `${escapeHtml(i.name)} × ${Number(i.qty)}点`)
+      .map(i => `${i.name} × ${i.qty}点`)
       .join("、");
-    const completedTime = escapeHtml(o.updated_at || o.created_at);
+    const completedTime = o.updated_at || o.created_at;
 
     return `
       <div class="history-item">
         <div>
-          <div><strong>${uidLabel}${escapeHtml(o.id)}</strong> <span style="font-size:0.8rem; color:#4a5568;">（${escapeHtml(o.account)}）</span></div>
+          <div><strong>${uidLabel}${o.id}</strong> <span style="font-size:0.8rem; color:#4a5568;">（${o.account}）</span></div>
           <div class="history-items-summary">${itemsSummary}</div>
           <div class="history-meta">完了時刻: ${completedTime} ／ 金額: ¥${Number(o.total_price || 0).toLocaleString()}</div>
         </div>
-        <button type="button" class="btn-revert-outline" onclick="revertCompletedOrder('${escapeHtml(o.id)}')">
+        <button type="button" class="btn-revert-outline" onclick="revertCompletedOrder('${o.id}')">
           引き渡し前に戻す
         </button>
       </div>
@@ -705,6 +768,9 @@ function renderCompletedHistory() {
   }).join("");
 }
 
+/**
+ * 誤って引き渡し完了にした注文を「決済済み（status: 1）」へ差し戻す
+ */
 async function revertCompletedOrder(orderId) {
   if (!confirm(`注文ID「${orderId}」を引き渡し待ち（決済済み）に戻しますか？`)) {
     return;
@@ -717,7 +783,7 @@ async function revertCompletedOrder(orderId) {
         account: staffAccount,
         pin: staffPin,
         orderId: orderId,
-        status: ORDER_STATUS.PAID
+        status: 1
       },
       { loadingText: "引き渡し待ちへ戻しています..." }
     );
@@ -729,18 +795,22 @@ async function revertCompletedOrder(orderId) {
 }
 
 // ==========================================
-// 4. ダッシュボード（売上・レジ締め集計）
+// 4. ダッシュボード（売上・レジ締め集計）機能
 // ==========================================
 function renderDashboard() {
-  const validPaidStatuses = [ORDER_STATUS.PAID, ORDER_STATUS.PICKING, ORDER_STATUS.COMPLETED];
-  const validPaidOrders = orders.filter(o => validPaidStatuses.includes(o.status));
-
+  const validPaidOrders = orders.filter(o => [1, 2, 3].includes(o.status));
   const totalSales = validPaidOrders.reduce((sum, o) => sum + Number(o.total_price || 0), 0);
+
+  // お預かり総額（received_amountが未記録の過去データがある場合はtotal_priceを補完）
   const totalReceived = validPaidOrders.reduce((sum, o) => {
     const rec = Number(o.received_amount);
-    return (!isNaN(rec) && rec > 0) ? sum + rec : sum;
+    if (!isNaN(rec) && rec > 0) {
+      return sum + rec;
+    }
+    return sum;
   }, 0);
 
+  // レジ締め用: お釣り払い出し総額（お預かり総額 - 総売上、0未満にはしない）
   const effectiveReceived = totalReceived > 0 ? totalReceived : totalSales;
   const totalChange = Math.max(0, effectiveReceived - totalSales);
 
@@ -762,8 +832,8 @@ function renderDashboard() {
     const stockClass = p.stock <= 5 ? "stock-low" : "stock-ok";
     return `
       <tr>
-        <td>${escapeHtml(p.id)}</td>
-        <td>${escapeHtml(p.name)}</td>
+        <td>${p.id}</td>
+        <td>${p.name}</td>
         <td>¥${Number(p.price).toLocaleString()}</td>
         <td>${soldQty}点</td>
         <td class="${stockClass}">${p.stock}点</td>
