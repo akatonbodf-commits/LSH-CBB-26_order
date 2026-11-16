@@ -1,173 +1,207 @@
-// config.js
-const APP_CONFIG = {
-  // デプロイしたGASのウェブアプリURLに書き換えてください
-  GAS_API_URL: "https://script.google.com/macros/s/AKfycbyWmha9IM3Io0qWl1nNI4-W1yts4I4gFm92eymr411bttK7mYovucOTn3_tsqlG9oFk-A/exec",
+/**
+ * 2026 CBB イベント物販・POSレジシステム 共通設定・通信・ユーティリティ (js/config.js)
+ */
 
-  // スタッフ画面の自動更新間隔（ミリ秒）
-  STAFF_POLL_INTERVAL: 30000 // 30秒
+const APP_CONFIG = {
+  // ★現在設定済みのGASウェブアプリURLに書き換えてください
+  GAS_API_URL: "https://script.google.com/macros/s/AKfycbyWmha9IM3Io0qWl1nNI4-W1yts4I4gFm92eymr411bttK7mYovucOTn3_tsqlG9oFk-A/exec",
+  STAFF_POLL_INTERVAL: 30000
 };
 
-let activeRequestCount = 0;
+/**
+ * 注文ステータス定数（マジックナンバー解消）
+ */
+const ORDER_STATUS = Object.freeze({
+  UNPAID: 0,     // 未決済
+  PAID: 1,       // 決済済み（ピッキング待ち）
+  PICKING: 2,    // ピッキング中
+  COMPLETED: 3,  // 引き渡し完了
+  CANCELED: 4    // キャンセル済み
+});
+
+// ==========================================
+// 共通UI・データ整形ユーティリティ
+// ==========================================
 
 /**
- * 全画面共通ローディングスピナーのDOM生成・表示
+ * HTMLエスケープ（innerHTML埋め込み時の表示崩れ・XSS防止）
  */
-function showGlobalSpinner(message = "通信中...") {
+function escapeHtml(value) {
+  if (value === null || value === undefined) return "";
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/**
+ * 入力欄へのEnterキー送信バインド（IME変換確定時は除外）
+ */
+function bindEnterKey(elementId, callback) {
+  const el = document.getElementById(elementId);
+  if (!el) return;
+  el.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.isComposing) {
+      e.preventDefault();
+      callback();
+    }
+  });
+}
+
+/**
+ * 複数注文の明細（items）を商品単位で合算して配列で返す共通関数
+ * @param {Array} targetOrders - 合算対象の注文オブジェクト配列
+ * @returns {Array<{id: string, name: string, price: number, qty: number, subtotal: number}>}
+ */
+function aggregateOrderItems(targetOrders) {
+  const aggregatedMap = new Map();
+
+  (targetOrders || []).forEach(order => {
+    (order.items || []).forEach(item => {
+      const key = String(item.id || item.name);
+      const price = Number(item.price || 0);
+      const qty = Number(item.qty || 0);
+
+      if (!aggregatedMap.has(key)) {
+        aggregatedMap.set(key, {
+          id: String(item.id || ""),
+          name: String(item.name || ""),
+          price: price,
+          qty: 0,
+          subtotal: 0
+        });
+      }
+
+      const entry = aggregatedMap.get(key);
+      entry.qty += qty;
+      entry.subtotal += price * qty;
+    });
+  });
+
+  return Array.from(aggregatedMap.values());
+}
+
+// ==========================================
+// 全画面ローディングスピナー＆GAS API通信ラッパー
+// ==========================================
+let activeLoadingCount = 0;
+
+function ensureSpinnerElement() {
   let overlay = document.getElementById("global-loading-overlay");
-  if (!overlay) {
-    const style = document.createElement("style");
-    style.textContent = `
-      #global-loading-overlay {
-        display: none;
-        position: fixed;
-        inset: 0;
-        background: rgba(15, 23, 42, 0.45);
-        backdrop-filter: blur(2px);
-        z-index: 9999;
-        align-items: center;
-        justify-content: center;
-      }
-      #global-loading-overlay.active {
-        display: flex;
-      }
-      .global-spinner-box {
-        background: #ffffff;
-        padding: 20px 28px;
-        border-radius: 12px;
-        box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        gap: 12px;
-        min-width: 160px;
-      }
-      .global-spinner-ring {
-        width: 38px;
-        height: 38px;
-        border: 4px solid #e2e8f0;
-        border-top-color: #3182ce;
-        border-radius: 50%;
-        animation: globalSpin 0.8s linear infinite;
-      }
-      .global-spinner-text {
-        font-size: 0.9rem;
-        font-weight: bold;
-        color: #1a365d;
-      }
-      @keyframes globalSpin {
-        to { transform: rotate(360deg); }
-      }
-    `;
-    document.head.appendChild(style);
+  if (overlay) return overlay;
 
-    overlay = document.createElement("div");
-    overlay.id = "global-loading-overlay";
-    overlay.innerHTML = `
-      <div class="global-spinner-box">
-        <div class="global-spinner-ring"></div>
-        <div id="global-spinner-text" class="global-spinner-text">通信中...</div>
-      </div>
-    `;
-    document.body.appendChild(overlay);
-  }
+  const style = document.createElement("style");
+  style.textContent = `
+    #global-loading-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.55);
+      backdrop-filter: blur(2px);
+      z-index: 9999;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      color: #ffffff;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    #global-loading-overlay.active {
+      display: flex;
+    }
+    .global-spinner-ring {
+      width: 48px;
+      height: 48px;
+      border: 4px solid rgba(255, 255, 255, 0.25);
+      border-top-color: #ffffff;
+      border-radius: 50%;
+      animation: globalSpin 0.8s linear infinite;
+      margin-bottom: 14px;
+    }
+    .global-spinner-text {
+      font-size: 0.95rem;
+      font-weight: bold;
+      letter-spacing: 0.03em;
+      text-align: center;
+      padding: 0 20px;
+    }
+    @keyframes globalSpin {
+      to { transform: rotate(360deg); }
+    }
+  `;
+  document.head.appendChild(style);
 
-  const textEl = document.getElementById("global-spinner-text");
-  if (textEl) textEl.textContent = message;
+  overlay = document.createElement("div");
+  overlay.id = "global-loading-overlay";
+  overlay.innerHTML = `
+    <div class="global-spinner-ring"></div>
+    <div id="global-spinner-label" class="global-spinner-text">通信中...</div>
+  `;
+  document.body.appendChild(overlay);
+  return overlay;
+}
+
+function showLoading(text = "通信中...") {
+  activeLoadingCount++;
+  const overlay = ensureSpinnerElement();
+  const label = document.getElementById("global-spinner-label");
+  if (label) label.textContent = text;
   overlay.classList.add("active");
 }
 
-function hideGlobalSpinner() {
-  const overlay = document.getElementById("global-loading-overlay");
-  if (overlay) {
-    overlay.classList.remove("active");
+function hideLoading() {
+  activeLoadingCount = Math.max(0, activeLoadingCount - 1);
+  if (activeLoadingCount === 0) {
+    const overlay = document.getElementById("global-loading-overlay");
+    if (overlay) overlay.classList.remove("active");
   }
 }
 
-/**
- * GASとのGET通信ヘルパー
- * @param {string} action
- * @param {object} params
- * @param {object} options { silent?: boolean, loadingText?: string }
- */
-async function apiGet(action = "public", params = {}, options = {}) {
-  const silent = Boolean(options.silent);
-  if (!silent) {
-    activeRequestCount++;
-    showGlobalSpinner(options.loadingText || "データを読み込み中...");
-  }
+async function apiGet(action, params = {}, options = {}) {
+  const { silent = false, loadingText = "データを読み込み中..." } = options;
+  if (!silent) showLoading(loadingText);
 
   try {
     const url = new URL(APP_CONFIG.GAS_API_URL);
     url.searchParams.set("action", action);
-    url.searchParams.set("_t", Date.now());
-
-    Object.entries(params).forEach(([key, val]) => {
-      if (val !== undefined && val !== null && val !== "") {
-        url.searchParams.set(key, String(val));
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== "") {
+        url.searchParams.set(k, String(v));
       }
     });
 
-    const res = await fetch(url.toString(), {
-      method: "GET",
-      redirect: "follow",
-      cache: "no-store"
-    });
-
-    if (!res.ok) {
-      throw new Error(`通信エラーが発生しました (HTTP ${res.status})`);
-    }
-
-    const data = await res.json();
-    if (!data.success) {
-      const err = new Error(data.message || "データの取得に失敗しました");
-      err.authError = Boolean(data.authError);
+    const res = await fetch(url.toString(), { method: "GET" });
+    const json = await res.json();
+    if (!json.success) {
+      const err = new Error(json.message || "データ取得エラー");
+      if (json.authError) err.authError = true;
       throw err;
     }
-    return data;
+    return json;
   } finally {
-    if (!silent) {
-      activeRequestCount = Math.max(0, activeRequestCount - 1);
-      if (activeRequestCount === 0) hideGlobalSpinner();
-    }
+    if (!silent) hideLoading();
   }
 }
 
-/**
- * GASとのPOST通信ヘルパー
- * @param {object} payload
- * @param {object} options { silent?: boolean, loadingText?: string }
- */
 async function apiPost(payload, options = {}) {
-  const silent = Boolean(options.silent);
-  if (!silent) {
-    activeRequestCount++;
-    showGlobalSpinner(options.loadingText || "処理を送信中...");
-  }
+  const { silent = false, loadingText = "処理を実行中..." } = options;
+  if (!silent) showLoading(loadingText);
 
   try {
     const res = await fetch(APP_CONFIG.GAS_API_URL, {
       method: "POST",
-      redirect: "follow",
-      cache: "no-store",
-      headers: {
-        "Content-Type": "text/plain;charset=utf-8"
-      },
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
       body: JSON.stringify(payload)
     });
-
-    if (!res.ok) {
-      throw new Error(`通信エラーが発生しました (HTTP ${res.status})`);
+    const json = await res.json();
+    if (!json.success) {
+      const err = new Error(json.message || "更新処理エラー");
+      if (json.authError) err.authError = true;
+      throw err;
     }
-
-    const data = await res.json();
-    if (!data.success) {
-      throw new Error(data.message || "リクエストの処理に失敗しました");
-    }
-    return data;
+    return json;
   } finally {
-    if (!silent) {
-      activeRequestCount = Math.max(0, activeRequestCount - 1);
-      if (activeRequestCount === 0) hideGlobalSpinner();
-    }
+    if (!silent) hideLoading();
   }
 }
